@@ -8,7 +8,10 @@ const getWmpfVersion = async (): Promise<number> => {
     const wmpfVersion = infoPlist.match(
             /<key>\s*CFBundleVersion\s*<\/key>\s*<string>([^<]*)<\/string>/
         )?.[1];
-    return Number(wmpfVersion);
+    // newer bundles carry "7.25800"-style versions where the WMPF build
+    // number is the last dot-separated segment
+    const buildNumber = wmpfVersion?.split(".").pop()?.trim() ?? "";
+    return /^\d+$/.test(buildNumber) ? Number(buildNumber) : Number(wmpfVersion);
 }
 
 export class DarwinPlatform implements IPlatform {

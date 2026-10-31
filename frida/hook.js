@@ -23,8 +23,9 @@ const patchCDPFilter = (base, config) => {
     if (config.CastToJsonHookOffset) {
         // credit: @Redbeanw44602, pr #262
         const osPlatform = getPlatform();
-        if (osPlatform === "windows" || osPlatform === "darwin") {
-            // TODO: this was not tested on darwin
+        if (osPlatform === "windows") {
+            // darwin must not take this path: its SendToClientFilter returns
+            // via a sret slot, so replacing it with this wrapper crashes WMPF
             const castToJsonFunc = new NativeFunction(
                 base.add(config.CastToJsonHookOffset),
                 "pointer",
@@ -83,8 +84,19 @@ const handleOnLoadStart = (a1, config) => {
         ? config.MiniAppConfigStructOffsets
         : config.SceneOffsets;
 
-    // legacy scene config
-    if (config.SceneOffsets) {
+    // darwin 25800: the remote debug config hangs off `this` directly
+    // (this+56 -> +1520 -> +16), not through the launch config
+    if (config.RemoteDebugConfigChain) {
+        remoteDebugConfigPtr = a1
+            .add(config.RemoteDebugConfigChain[0])
+            .readPointer()
+            .add(config.RemoteDebugConfigChain[1])
+            .readPointer()
+            .add(config.RemoteDebugConfigChain[2])
+            .readPointer();
+        miniappScenePtr = remoteDebugConfigPtr.add(structOffsets.SceneOffset);
+    } else if (config.SceneOffsets) {
+        // legacy scene config
         miniappLaunchConfigPtr = a1
             .add(structOffsets[0])
             .readPointer()
@@ -154,8 +166,13 @@ const handleOnLoadStart = (a1, config) => {
 
     // setup the websocket back connection URL for new flue builds
     // it's now adjustable as well :)
+    // on darwin the URL string lives in the remote debug config (rc-relative),
+    // on win32/linux in the launch config
     const websocketUrl = "ws://localhost:9421";
-    const websocketUrlStringPtr = miniappLaunchConfigPtr
+    const websocketUrlBasePtr = getPlatform() === "darwin"
+            ? remoteDebugConfigPtr
+            : miniappLaunchConfigPtr;
+    const websocketUrlStringPtr = websocketUrlBasePtr
             .add(structOffsets.WebSocketURLStringOffset);
     const stringMarker = websocketUrlStringPtr.add(23).readS8();
     if (stringMarker < 0) {
@@ -172,13 +189,40 @@ const handleOnLoadStart = (a1, config) => {
     const remoteDebugModePtr = remoteDebugConfigPtr
             .add(structOffsets.RemoteDebugModeOffset);
     send(`[hook] remote debug mode: ${remoteDebugModePtr.readInt()} -> 1`);
+    const originalMode = remoteDebugModePtr.readInt();
     remoteDebugModePtr.writeInt(1);
+
+    // the scene/debug-mode values live in a struct shared across containers:
+    // keeping scene=1101 + mode=1 makes every later container re-enter the
+    // single-shot debug lifecycle (fails with "LifeCycle.load fail" and
+    // crashes some programs), so the caller clears the debug-mode flag
+    // shortly after this call; the network reporter only checks scene==1101
+    return {
+        modePtr: remoteDebugModePtr,
+        originalMode,
+    };
 };
+
+const patchedContainers = new Set();
 
 const patchOnLoadStart = (base, config) => {
     // xref: AppletIndexContainer::OnLoadStart
     Interceptor.attach(base.add(config.LoadStartHookOffset), {
         onEnter(args) {
+            // patching the same container twice re-runs the (single-shot)
+            // debug lifecycle, which fails with
+            // "LifeCycle.load fail: Cannot set a non-pending waiting value"
+            // and tears down the debug client, so every later OnLoadStart of
+            // an already-patched container is left untouched
+            const container = args[0].toString();
+            if (patchedContainers.has(container)) {
+                return;
+            }
+            if (patchedContainers.size > 64) {
+                patchedContainers.clear();
+            }
+            patchedContainers.add(container);
+
             send(
                 `[inteceptor] AppletIndexContainer::OnLoadStart onEnter, ` +
                 `indexContainer.this: ${args[0]}`,
@@ -188,10 +232,30 @@ const patchOnLoadStart = (base, config) => {
                 args[1] = args[1].and(ptr("0xffffffffffffff00")).or(1);
             }
             // handle onLoadStart parameters
-            handleOnLoadStart(args[0], config);
+            try {
+                this.patchInfo = handleOnLoadStart(args[0], config);
+            } catch (e) {
+                // a bogus pointer chain on one container must not take down
+                // the interceptor for the whole process
+                send(`[hook] handleOnLoadStart failed: ${e}`);
+            }
         },
         onLeave(retval) {
-            // do nothing
+            const info = this.patchInfo;
+            if (!info) return;
+            // keep scene=1101 (the per-request network reporter checks it)
+            // but clear the debug-mode flag ~2s in, once the appservice has
+            // dialed back: the container debug lifecycle is gated on BOTH
+            // scene==1101 and mode==1, so this stops later containers from
+            // re-entering it (the crash trigger)
+            setTimeout(() => {
+                try {
+                    info.modePtr.writeInt(info.originalMode);
+                    send(`[hook] debug mode restored to ${info.originalMode}`);
+                } catch (e) {
+                    send(`[hook] debug mode restore failed: ${e}`);
+                }
+            }, 2000);
         },
     });
 };

@@ -14,8 +14,9 @@ const messageProto = require("./third-party/WARemoteDebugProtobuf.js");
 class DebugMessageEmitter extends EventEmitter {}
 
 type StructOffsetConfig = {
-    LaunchConfigOffsets: number[];
-    RemoteDebugConfigOffsets: number[];
+    // omitted when RemoteDebugConfigChain is used instead
+    LaunchConfigOffsets?: number[];
+    RemoteDebugConfigOffsets?: number[];
     SceneOffset: number;
     WebSocketURLStringOffset: number;
     RemoteDebugModeOffset: number;
@@ -28,6 +29,9 @@ type HookConfig = {
     CastToJsonHookOffset?: string;
     SceneOffsets?: number[];
     MiniAppConfigStructOffsets?: StructOffsetConfig;
+    // pointer chain from `this` to the remote debug config, for builds where it
+    // is not reachable through the launch config (e.g. darwin 25800)
+    RemoteDebugConfigChain?: number[];
 };
 
 const debugMessageEmitter = new DebugMessageEmitter();
@@ -66,6 +70,32 @@ const debugServer = (options: CliOptions, logger: Logger): WebSocketServer  => {
 
         if (unwrappedData === null) {
             return;
+        }
+
+        if (unwrappedData.category === "customMessage") {
+            // the runtime reports wx.request traffic as `__networkDebug` custom
+            // messages whose payload is already a standard CDP Network.* event;
+            // relay it verbatim so the DevTools Network panel renders it
+            const cm = unwrappedData.data ?? {};
+            if (cm.method === "__networkDebug") {
+                try {
+                    const evt = JSON.parse(String(cm.payload));
+                    if (
+                        evt &&
+                        typeof evt.method === "string" &&
+                        evt.method.startsWith("Network.")
+                    ) {
+                        debugMessageEmitter.emit(
+                            "cdpmessage",
+                            String(cm.payload),
+                        );
+                    }
+                } catch (e) {
+                    logger.error(
+                        `[proxy] malformed __networkDebug payload: ${e}`,
+                    );
+                }
+            }
         }
 
         if (unwrappedData.category === "chromeDevtoolsResult") {
@@ -240,36 +270,40 @@ const fridaServer = async (options: CliOptions, logger: Logger): Promise<frida.S
         throw new Error("[frida] hook script not found");
     }
 
-    let configContent: string | null = null;
+    let hookConfig: HookConfig;
     if (options.autoDetect) {
         logger.info(`[frida] auto-detecting hook offsets...`);
-        const config = await autoDetectConfig(session, projectRoot, wmpfVersion);
-        configContent = JSON.stringify(config);
-        logger.info(`[frida] detected hook offsets: ${configContent}`);
+        hookConfig = await autoDetectConfig(session, projectRoot, wmpfVersion);
+        logger.info(`[frida] detected hook offsets: ${JSON.stringify(hookConfig)}`);
     } else {
         try {
-            configContent = (
-                await promises.readFile(
-                    path.join(
-                        projectRoot,
-                        `frida/config/${process.platform}`,
-                        `addresses.${wmpfVersion}.json`,
-                    ),
-                )
-            ).toString();
-            configContent = JSON.stringify(JSON.parse(configContent));
+            hookConfig = JSON.parse(
+                (
+                    await promises.readFile(
+                        path.join(
+                            projectRoot,
+                            `frida/config/${process.platform}`,
+                            `addresses.${wmpfVersion}.json`,
+                        ),
+                    )
+                ).toString(),
+            );
         } catch (e) {
             throw new Error(`[frida] version config not found: ${wmpfVersion}`);
         }
     }
 
-    if (scriptContent === null || configContent === null) {
+    // the miniapp connects back to us, so the hook script has to rewrite the
+    // launch config with the port our debug server is actually listening on
+    hookConfig.DebugPort = options.debugPort;
+
+    if (scriptContent === null) {
         throw new Error("[frida] unable to find hook script");
     }
 
     // load script
     const script = await session.createScript(
-        scriptContent.replace("@@CONFIG@@", configContent),
+        scriptContent.replace("@@CONFIG@@", JSON.stringify(hookConfig)),
     );
     script.message.connect((message: frida.Message) => {
         if (message.type === "error") {

@@ -6,6 +6,8 @@ type CliOptions = {
     debugMain: boolean;
     debugFrida: boolean;
     autoDetect: boolean;
+    xwebBridge: boolean;
+    xwebNetlogMode: string;
 };
 
 // default debugging port, do not change
@@ -23,6 +25,9 @@ Options:
   --debug-main         Output main process debug messages
   --debug-frida        Output Frida client messages
   --auto-detect        Automatically detect hook offsets (Windows x64)
+  --no-xweb            Disable the xweb-use bridge (netlog capture of response
+                       bodies via the runtime's automation server)
+  --xweb-netlog-mode <mode>  net-export capture mode (default: IncludeSocketBytes)
   -h, --help           Show this help message`);
 };
 
@@ -51,6 +56,8 @@ const parse_cli_options = (): CliOptions => {
             "debug-main": { type: "boolean" },
             "debug-frida": { type: "boolean" },
             "auto-detect": { type: "boolean" },
+            "no-xweb": { type: "boolean" },
+            "xweb-netlog-mode": { type: "string" },
             help: { type: "boolean", short: "h" },
         },
         allowPositionals: false,
@@ -67,6 +74,8 @@ const parse_cli_options = (): CliOptions => {
         debugMain: values["debug-main"] ?? false,
         debugFrida: values["debug-frida"] ?? false,
         autoDetect: values["auto-detect"] ?? false,
+        xwebBridge: !(values["no-xweb"] ?? false),
+        xwebNetlogMode: values["xweb-netlog-mode"] ?? "IncludeSocketBytes",
     };
 };
 

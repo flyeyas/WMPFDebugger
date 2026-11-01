@@ -9,6 +9,7 @@ import { parse_cli_options, CliOptions } from "./cli";
 import { create_logger, Logger } from "./logger";
 import { xwebMain } from "./xweb/main";
 import { startXwebBridge } from "./xweb/bridge";
+import { BodyHook, SYNTH_EVAL_ID_BASE } from "./bodyhook";
 
 const codex = require("./third-party/RemoteDebugCodex.js");
 const messageProto = require("./third-party/WARemoteDebugProtobuf.js");
@@ -65,6 +66,8 @@ const cdpRelay = {
     samples: new Set<string>(),
     // what the DevTools frontend itself sends (Network.enable present?)
     clientMethods: new Map<string, number>(),
+    // ids the runtime actually answers with (first 10 logged)
+    resultIdSamples: new Set<number>(),
 };
 
 const pushCdpBuffer = (message: string) => {
@@ -104,7 +107,11 @@ const bufferToHexString = (buffer: ArrayBuffer) => {
         .join("");
 };
 
-const debugServer = (options: CliOptions, logger: Logger): WebSocketServer  => {
+const debugServer = (
+    options: CliOptions,
+    logger: Logger,
+    bodyHook: BodyHook,
+): WebSocketServer  => {
     const wss = new WebSocketServer({ port: options.debugPort });
     logger.info(
         `[server] debug server running on ws://localhost:${options.debugPort}`,
@@ -177,6 +184,31 @@ const debugServer = (options: CliOptions, logger: Logger): WebSocketServer  => {
         }
 
         if (unwrappedData.category === "chromeDevtoolsResult") {
+            const payloadStr = String(unwrappedData.data?.payload ?? "");
+            try {
+                const parsed = JSON.parse(payloadStr) as {
+                    id?: unknown;
+                    method?: unknown;
+                    params?: { context?: { id?: unknown } };
+                };
+                // synthetic command responses (body hook) are consumed here
+                // and never reach the DevTools clients
+                if (typeof parsed?.id === "number" && parsed.id >= SYNTH_EVAL_ID_BASE) {
+                    bodyHook.handleSyntheticResponse(parsed.id, payloadStr);
+                    return;
+                }
+                // feed the appContext resolver (probe protocol, see notes.md §3)
+                if (parsed?.method === "Runtime.executionContextCreated") {
+                    const ctxId = parsed.params?.context?.id;
+                    if (typeof ctxId === "number") {
+                        bodyHook.onExecutionContextCreated(ctxId);
+                    }
+                } else if (parsed?.method === "Runtime.executionContextsCleared") {
+                    bodyHook.onExecutionContextsCleared();
+                }
+            } catch {
+                // fall through to relay
+            }
             // need to proxy to CDP client
             cdpRelay.stats.devtoolsResultRelayed++;
             debugMessageEmitter.emit("cdpmessage", unwrappedData.data.payload);
@@ -185,12 +217,16 @@ const debugServer = (options: CliOptions, logger: Logger): WebSocketServer  => {
 
     wss.on("connection", (ws: WebSocket) => {
         logger.info("[miniapp] miniapp client connected");
+        bodyHook.setMiniappConnected(true);
         ws.on("message", onMessage);
         ws.on("error", (err) => {
             logger.error("[miniapp] miniapp client err:", err);
         });
         ws.on("close", () => {
             logger.info("[miniapp] miniapp client disconnected");
+            if (wss.clients.size === 0) {
+                bodyHook.setMiniappConnected(false);
+            }
         });
     });
 
@@ -236,6 +272,9 @@ const debugServer = (options: CliOptions, logger: Logger): WebSocketServer  => {
 // follow-up events of one logical request keep a stable mapping.
 type ClientRelayState = {
     idMap: Map<string, string>;
+    // rewritten id -> request identity, for answering Network.getResponseBody
+    // from body-hook captures (the runtime cannot serve appservice bodies)
+    idInfo: Map<string, { method: string; url: string }>;
     idSeq: number;
     enableSeen: boolean;
 };
@@ -251,7 +290,11 @@ const rewriteNetworkEventForClient = (
     }
     let evt: {
         method?: string;
-        params?: { requestId?: unknown; redirectResponse?: unknown };
+        params?: {
+            requestId?: unknown;
+            redirectResponse?: unknown;
+            request?: { url?: unknown; method?: unknown };
+        };
     };
     try {
         evt = JSON.parse(message);
@@ -268,6 +311,7 @@ const rewriteNetworkEventForClient = (
     }
     if (state.idMap.size > 8000) {
         state.idMap.clear();
+        state.idInfo.clear();
     }
     const orig = evt.params.requestId;
     const isRedirect =
@@ -277,11 +321,24 @@ const rewriteNetworkEventForClient = (
         mapped = `u${++state.idSeq}_${orig}`;
     }
     state.idMap.set(orig, mapped);
+    if (evt.method === "Network.requestWillBeSent") {
+        state.idInfo.set(mapped, {
+            method:
+                typeof evt.params.request?.method === "string"
+                    ? evt.params.request.method.toUpperCase()
+                    : "GET",
+            url: typeof evt.params.request?.url === "string" ? evt.params.request.url : "",
+        });
+    }
     evt.params.requestId = mapped;
     return JSON.stringify(evt);
 };
 
-const proxyServer = (options: CliOptions, logger: Logger): WebSocketServer => {
+const proxyServer = (
+    options: CliOptions,
+    logger: Logger,
+    bodyHook: BodyHook,
+): WebSocketServer => {
     const wss = new WebSocketServer({ port: options.cdpPort });
     logger.info(
         `[server] proxy server running on ws://localhost:${options.cdpPort}`,
@@ -294,6 +351,7 @@ const proxyServer = (options: CliOptions, logger: Logger): WebSocketServer => {
         logger.info("[cdp] CDP client connected");
         const state: ClientRelayState = {
             idMap: new Map(),
+            idInfo: new Map(),
             idSeq: 0,
             enableSeen: false,
         };
@@ -303,12 +361,42 @@ const proxyServer = (options: CliOptions, logger: Logger): WebSocketServer => {
             const message = String(data);
             // count which domains the DevTools frontend actually enables
             try {
-                const evt = JSON.parse(message) as { method?: unknown };
+                const evt = JSON.parse(message) as {
+                    method?: unknown;
+                    id?: unknown;
+                    params?: { requestId?: unknown };
+                };
                 if (evt && typeof evt.method === "string") {
                     cdpRelay.clientMethods.set(
                         evt.method,
                         (cdpRelay.clientMethods.get(evt.method) ?? 0) + 1,
                     );
+                    // answer getResponseBody from body-hook captures when
+                    // possible; the runtime itself cannot serve appservice
+                    // response bodies ("No resource with given identifier")
+                    if (evt.method === "Network.getResponseBody") {
+                        const reqId =
+                            typeof evt.params?.requestId === "string"
+                                ? evt.params.requestId
+                                : undefined;
+                        const info = reqId ? state.idInfo.get(reqId) : undefined;
+                        const body =
+                            info && info.url
+                                ? bodyHook.takeBody(info.method, info.url)
+                                : undefined;
+                        if (info && body !== undefined) {
+                            logger.info(
+                                `[body] served getResponseBody: ${info.method} ${info.url.slice(0, 120)}`,
+                            );
+                            ws.send(
+                                JSON.stringify({
+                                    id: evt.id,
+                                    result: { body, base64Encoded: false },
+                                }),
+                            );
+                            return;
+                        }
+                    }
                     if (evt.method === "Network.enable" && !state.enableSeen) {
                         state.enableSeen = true;
                         // the frontend registers its Network dispatcher on
@@ -525,8 +613,14 @@ const main = async () => {
 
     const options = parse_cli_options();
     const logger = create_logger(options);
-    const debugWss = debugServer(options, logger);
-    const proxyWss = proxyServer(options, logger);
+    const bodyHook = new BodyHook(logger, (command) => {
+        // synthetic CDP commands through the existing relay path (same
+        // channel the DevTools console uses); responses are consumed by the
+        // hook in the miniapp message handler
+        debugMessageEmitter.emit("proxymessage", JSON.stringify(command));
+    });
+    const debugWss = debugServer(options, logger, bodyHook);
+    const proxyWss = proxyServer(options, logger, bodyHook);
     const fridaSession = await fridaServer(options, logger);
 
     // the xweb bridge discovers the runtime's local automation server once a
@@ -567,7 +661,8 @@ const main = async () => {
             `networkRelayed=${cdpRelay.stats.networkRelayed} ` +
             `netReqIds=${cdpRelay.requestIds.size} ` +
             `devtoolsResultRelayed=${cdpRelay.stats.devtoolsResultRelayed} ` +
-            `droppedNonNetwork=${cdpRelay.stats.droppedNonNetwork}` +
+            `droppedNonNetwork=${cdpRelay.stats.droppedNonNetwork} ` +
+            `bodies=${bodyHook.bodies}` +
             others +
             netMethods +
             clientMethods;
